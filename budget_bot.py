@@ -272,4 +272,8 @@ def other_handlers(message):
         bot.send_message(message.chat.id, "Используй кнопки для управления бюджетом.", reply_markup=main_menu())
 
 print("✅ Бот с новыми категориями запущен!")
+<<<<<<< Updated upstream
 bot.infinity_polling()
+=======
+bot.infinity_polling()
+>>>>>>> Stashed changes
