@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import os
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, PieChart, Reference
-from openpyxl.styles import Font, Alignment
 
 TOKEN = "8881978694:AAEQA7iJby2z5HN9Lj_gMuYClkyp_OGwj5A"
 bot = telebot.TeleBot(TOKEN)
@@ -52,9 +51,9 @@ def get_user_df(user_id):
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.send_message(message.chat.id, "👋 Бот готов! Используй кнопки.", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "👋 Бот готов!", reply_markup=main_menu())
 
-# Добавление операций (простое)
+# Добавление (упрощённо)
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить")
 def add_operation(message):
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
@@ -64,79 +63,100 @@ def add_operation(message):
     )
     bot.send_message(message.chat.id, "Что добавляем?", reply_markup=markup)
 
-# ... (остальные функции добавления можно взять из предыдущих версий)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("add_"))
+def callback_add(call):
+    tr_type = "expense" if call.data == "add_expense" else "income"
+    cats = expense_categories if tr_type == "expense" else income_categories
+    text = f"Выберите категорию:\n\n" + "\n".join([f"{i+1}. {cat}" for i, cat in enumerate(cats)])
+    msg = bot.send_message(call.message.chat.id, text)
+    bot.register_next_step_handler(msg, lambda m: process_category(m, tr_type))
 
-# ================== КРАСИВЫЕ ТЕКСТОВЫЕ ОТЧЁТЫ ==================
-@bot.message_handler(func=lambda m: m.text == "📊 Отчёты")
-def reports(message):
+def process_category(message, tr_type):
+    try:
+        num = int(message.text.strip())
+        cats = expense_categories if tr_type == "expense" else income_categories
+        category = cats[num-1]
+        bot.send_message(message.chat.id, f"✅ {category}\nВведите сумму:")
+        bot.register_next_step_handler(message, lambda m: process_amount(m, category, tr_type))
+    except:
+        bot.send_message(message.chat.id, "❌ Введите номер.")
+
+def process_amount(message, category, tr_type):
+    try:
+        amount = float(message.text.replace(',', '.').strip())
+        bot.send_message(message.chat.id, "Комментарий (или '-'):")
+        bot.register_next_step_handler(message, lambda m: save_transaction(m, tr_type, amount, category))
+    except:
+        bot.send_message(message.chat.id, "❌ Введите сумму.")
+
+def save_transaction(message, tr_type, amount, category):
     user_id = message.from_user.id
+    date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    description = message.text if message.text != "-" else ""
+    cursor.execute("INSERT INTO transactions (user_id, date, type, amount, category, description) VALUES (?, ?, ?, ?, ?, ?)",
+                   (user_id, date, tr_type, amount, category, description))
+    conn.commit()
+    emoji = "➖" if tr_type == "expense" else "➕"
+    bot.send_message(message.chat.id, f"{emoji} Записано: {category} — {amount} ₽", reply_markup=main_menu())
+
+# ================== ОТЧЁТЫ ==================
+@bot.message_handler(func=lambda m: m.text == "📊 Отчёты")
+def choose_period_report(message):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    periods = ["День", "Неделя", "Месяц", "Всё время"]
+    for p in periods:
+        markup.add(telebot.types.InlineKeyboardButton(p, callback_data=f"report_{p}"))
+    bot.send_message(message.chat.id, "Выберите период:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("report_"))
+def generate_report(call):
+    period = call.data.split("_")[1]
+    user_id = call.from_user.id
     df = get_user_df(user_id)
     if df.empty:
-        bot.send_message(message.chat.id, "Нет операций.")
+        bot.send_message(call.message.chat.id, "Нет операций.")
         return
 
     now = datetime.now()
-    month = df[df['date'].dt.month == now.month]
-    
-    income = month[month['type']=='income']['amount'].sum()
-    expense = month[month['type']=='expense']['amount'].sum()
-    
-    text = f"<b>📊 Отчёт за {now.strftime('%B %Y')}</b>\n\n"
-    text += f"➕ Доходы: {income:,.0f} ₽\n"
-    text += f"➖ Расходы: {expense:,.0f} ₽\n"
-    text += f"💰 Баланс: {income-expense:,.0f} ₽\n\n"
-    
-    if expense > 0:
-        top = month[month['type']=='expense'].groupby('category')['amount'].sum().nlargest(8)
-        text += "<b>🔥 Топ расходов:</b>\n"
-        for cat, val in top.items():
-            text += f"• {cat:<22} {val:>8,.0f} ₽\n"
-    
-    bot.send_message(message.chat.id, text, parse_mode='HTML')
+    if period == "День":
+        filtered = df[df['date'].dt.date == now.date()]
+    elif period == "Неделя":
+        filtered = df[df['date'] >= now - timedelta(days=7)]
+    elif period == "Месяц":
+        filtered = df[df['date'].dt.month == now.month]
+    else:
+        filtered = df
 
-# ================== ЭКСПОРТ В EXCEL С ГРАФИКАМИ ==================
+    income = filtered[filtered['type']=='income']['amount'].sum()
+    expense = filtered[filtered['type']=='expense']['amount'].sum()
+
+    text = f"<b>Отчёт за {period}</b>\n\n"
+    text += f"➕ Доходы: {income:,.0f} ₽\n➖ Расходы: {expense:,.0f} ₽\n💰 Баланс: {income-expense:,.0f} ₽\n\n"
+
+    if expense > 0:
+        top = filtered[filtered['type']=='expense'].groupby('category')['amount'].sum().nlargest(8)
+        text += "<b>Топ расходов:</b>\n"
+        for cat, val in top.items():
+            text += f"• {cat}: {val:,.0f} ₽ ({val/expense*100:.1f}%)\n"
+
+    bot.send_message(call.message.chat.id, text, parse_mode='HTML')
+
+# ================== ЭКСПОРТ ==================
 @bot.message_handler(func=lambda m: m.text == "📤 Экспорт Excel")
 def export_excel(message):
     user_id = message.from_user.id
     df = pd.read_sql_query("SELECT * FROM transactions WHERE user_id = ?", conn, params=(user_id,))
-    
     if df.empty:
         bot.send_message(message.chat.id, "Нет данных.")
         return
 
     filename = f"budget_{user_id}.xlsx"
-    
     with pd.ExcelWriter(filename, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Все операции', index=False)
-        summary = df.groupby(['type', 'category']).agg({'amount': 'sum'}).reset_index()
-        summary.to_excel(writer, sheet_name='Сводка', index=False)
-    
-    # Добавляем графики
-    wb = writer.book
-    ws = wb['Сводка']
-    
-    expense_data = summary[summary['type'] == 'expense']
-    if not expense_data.empty:
-        chart = PieChart()
-        labels = Reference(ws, min_col=2, min_row=2, max_row=len(expense_data)+1)
-        data = Reference(ws, min_col=3, min_row=1, max_row=len(expense_data)+1)
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(labels)
-        chart.title = "Расходы по категориям"
-        ws.add_chart(chart, "E2")
-    
-    chart2 = BarChart()
-    chart2.add_data(data, titles_from_data=True)
-    chart2.set_categories(labels)
-    chart2.title = "Сравнение расходов"
-    ws.add_chart(chart2, "E20")
-    
-    wb.save(filename)
     
     with open(filename, 'rb') as f:
-        bot.send_document(message.chat.id, f, caption="📊 Твой бюджет в Excel с графиками!")
-    
+        bot.send_document(message.chat.id, f, caption="📊 Твой бюджет в Excel")
     os.remove(filename)
 
-print("✅ Бот с текстовыми таблицами и Excel запущен!")
+print("✅ Бот запущен!")
 bot.infinity_polling()
